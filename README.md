@@ -1,91 +1,33 @@
 # Activity Trail
 
-Activity Trail is an open-source service a team clones and hosts in its own environment. Publishing applications send one event per changed field to a Kafka topic. Activity Trail stores one row per event and serves that history through a read API. A support tool uses the API, for one object in one application, to answer who changed a field, when it changed, the old value, and the new value.
+## What this repository is
 
-The repository name is `activitytrail`. The product name is Activity Trail. Version 1 is one Java 21 Spring Boot process, built with Gradle. The runnable artifact is `build/libs/activitytrail.jar`.
+Activity Trail is an open-source Java service a team clones and runs in its own environment. The repository name is `activitytrail`. Version 1 is one Java 21 process on Spring Boot 4.1.2, built with Gradle. The artifact is `build/libs/activitytrail.jar`.
+
+Publishing applications send one Kafka event per changed field. This process consumes that topic, stores one PostgreSQL row per event, and serves the history through a read API. A support tool calls that API for one object in one application and receives who changed a field, when it changed, the old value, and the new value.
+
+The publishing application remains the system of record for the business object. Activity Trail is the system of record for the history it has stored. Kafka is only the buffer between the client's commit and that store. The product rules are in [docs/prd.md](docs/prd.md). The code shape is in [docs/architecture.md](docs/architecture.md).
+
+## What problem it solves
+
+Software clients need a shared field-level history without building a separate audit store for every application.
+
+A customer-profile service and an orders service can both publish to one topic. Support can then ask, for one profile or one order, which field changed, who changed it, the previous value, and the new value. The client's own request returns when its database commits. It does not wait for Activity Trail. A change that was never published is absent from the read API. An empty history means no event was stored. It does not mean the source data never changed.
+
+Activity Trail does not watch databases, does not ship a publisher SDK, and does not invent a change a client never published.
+
+## Clone, customize, and self-host
+
+A host runs three things: PostgreSQL 16 or newer, a Kafka cluster, and this process.
 
 ```sh
+git clone https://github.com/Amitercse/ActivityTrail.git
+cd ActivityTrail
 ./gradlew bootJar
 java -jar build/libs/activitytrail.jar --spring.profiles.active=local
 ```
 
-Start that command from the repository root. The profile selects the environment: `local`, `qal`, `e2e`, or `prod`. The process serves HTTP and starts the Kafka consumer. A container image is `docker build -t activitytrail .` after the JAR exists. Pass the same profile when the container starts.
-
-The default PostgreSQL database can be created from the scripts in [`db/postgres`](db/postgres) before the JAR starts. Flyway also applies `V1__schema.sql` on startup when the tables are not already there.
-
-| Document | What it decides |
-| --- | --- |
-| [docs/prd.md](docs/prd.md) | Product requirements: actors, record shape, API, retention, and acceptance tests. |
-| [docs/architecture.md](docs/architecture.md) | How version 1 runs: one application, with controller, service, and repository packages. |
-
-Publishing is the client’s job. Version 1 does not ship a publisher SDK, does not watch databases, and does not invent a change a client never published. The owning application remains the system of record for the business object. The configured store is the system of record for stored history. PostgreSQL is the store that ships with the repository. Kafka is the buffer between the client commit and that store.
-
-## What a host runs
-
-A host operates three things:
-
-1. A database. The default scripts create a PostgreSQL database named `activitytrail`.
-2. A Kafka cluster with the topics in the architecture document.
-3. This service. One process registers applications, reads history, and consumes Kafka.
-
-Support engineers do not log into Activity Trail. A support application calls the read API with the application id in the path.
-
-## Access control belongs to the host
-
-Activity Trail is open source. A team clones the repository and hosts it for its own applications. Each host already has its own network policy, identity system, and Kafka access rules. Those differ from one organization to the next, so this service ships the history path and leaves caller authentication to the host.
-
-The host applies that policy outside the process, with a private network, a gateway, or Kafka ACLs. A host whose policy must run inside the service extends this code and keeps the record rules, the topic, and the read response. The shipped service does not authenticate callers and does not decide who may use Kafka.
-
-| Question | Answer in the shipped service |
-| --- | --- |
-| How does an application id get registered? | `POST /v1/operator/applications`. The body carries `application_id` and `display_name`. The response is 201. The same id again is 409. Events for an id that was never posted are not stored. |
-| Who may call that POST, the read API, or the other HTTP routes? | The hosting organization. Put the API on a private network or behind a gateway. To enforce the check inside this process, extend the code. |
-| Who may produce to `activitytrail.field-changes`? | The host’s Kafka ACLs. The consumer stores a message when its `application_id` is registered and enabled. |
-| Who may run the consumer or read the dead-letter topic? | The host’s Kafka ACLs. The process joins group `activitytrail` when it starts. |
-
-## Create the default database
-
-Install PostgreSQL 16 or newer. From this repository:
-
-```sh
-psql -d postgres -v ON_ERROR_STOP=1 -f db/postgres/001_create_database.sql
-psql -d activitytrail -1 -v ON_ERROR_STOP=1 -f db/postgres/V1__schema.sql
-```
-
-`001_create_database.sql` creates a database named `activitytrail`. It fails if that name already exists. `V1__schema.sql` creates `application`, `field_activity_trail`, and `retention_run`, the check constraints, and the default indexes. The schema script fails if those tables already exist.
-
-The default `field_activity_trail` table is unpartitioned. The default indexes are:
-
-- primary key on `event_id`
-- object history on `(application_id, object_name, object_id, updated_at, recorded_at, event_id)`
-- single-field history, the same key with `object_field` before `updated_at`
-- retention on `(application_id, updated_at)`
-
-When the JAR exists, Flyway applies `db/postgres/V1__schema.sql` on startup if the tables are not already there. A host who applied it by hand sets the Flyway baseline to version 1 so startup does not apply that script twice:
-
-```sh
-export SPRING_FLYWAY_BASELINE_ON_MIGRATE=true
-export SPRING_FLYWAY_BASELINE_VERSION=1
-```
-
-## What a host can change
-
-These changes stay outside the HTTP API and the Kafka contract.
-
-| Setting | Default | How a host changes it |
-| --- | --- | --- |
-| Database | PostgreSQL, in the `repository` package | Replace `PostgresFieldActivityRepository`. The controller and the service stay as they are. `db/postgres` applies only to the PostgreSQL implementation. |
-| Indexes and partitions | The indexes in `V1__schema.sql`. The table is unpartitioned. | Add SQL under [`db/postgres/custom`](db/postgres/custom) with Flyway versions `V1000` and above, for example `V1000__extra_index.sql`. The application issues the logical read and insert. It does not name secondary indexes. Keep `event_id` unique and keep the check constraints. |
-| Retention window | 365 days for a new application | Set `RETENTION_DAYS_DEFAULT`, or send `retention_days` from 1 to 3650 on the register POST. |
-| Retention deletion | Enabled | Set `RETENTION_ENABLED=false` to stop all deletion. Set an application’s `retention_days` to JSON `null` to keep that application’s rows while other applications still expire. |
-
-`RETENTION_ENABLED=false` is the switch that turns deletion off for the whole installation. The daily job can stay scheduled. The pass exits successfully and deletes nothing. Leaving `retention_days` empty on one application turns deletion off for that application only.
-
-A custom script may replace the three secondary indexes. On PostgreSQL, partitioning `field_activity_trail` by time means the primary key has to include the partition column. The shipped insert uses a conflict target of `event_id` alone, which matches the unpartitioned primary key. A partitioned layout that changes that target is a change in the store adapter, not in the read API.
-
-## Environments
-
-Shared settings are in `src/main/resources/application.properties`. Each environment has its own file. The process refuses to start until one of these profiles is selected.
+Start the JAR from the repository root so Flyway can read `db/postgres`. The process listens on port 8080, applies the schema, and joins Kafka consumer group `activitytrail`. The profile must be `local`, `qal`, `e2e`, or `prod`. Without one of those, the process refuses to start.
 
 | Profile | File | Database and Kafka |
 | --- | --- | --- |
@@ -94,32 +36,59 @@ Shared settings are in `src/main/resources/application.properties`. Each environ
 | `e2e` | `application-e2e.properties` | Same variables, pointed at the end-to-end cluster. |
 | `prod` | `application-prod.properties` | Same variables, pointed at production. |
 
+`DATABASE_URL` is the JDBC URL. `KAFKA_BROKERS` is the broker list. QAL, E2E, and prod do not commit hostnames or passwords. A host that authenticates PostgreSQL separately adds `spring.datasource.username` and `spring.datasource.password`.
+
+Create the Kafka topics before the process starts:
+
+| Topic | Partitions | Cleanup | Retention |
+| --- | --- | --- | --- |
+| `activitytrail.field-changes` | 12 | `delete` | 7 days (`retention.ms=604800000`). A host may raise this and must not lower it. |
+| `activitytrail.field-changes.dlq` | 12 | `delete` | 14 days |
+
+The database scripts are in [`db/postgres`](db/postgres). Flyway applies `V1__schema.sql` on startup when the tables are not already there. A host who applied that script by hand sets `SPRING_FLYWAY_BASELINE_ON_MIGRATE=true` and `SPRING_FLYWAY_BASELINE_VERSION=1`.
+
 ```sh
-java -jar build/libs/activitytrail.jar --spring.profiles.active=prod
+psql -d postgres -v ON_ERROR_STOP=1 -f db/postgres/001_create_database.sql
+psql -d activitytrail -1 -v ON_ERROR_STOP=1 -f db/postgres/V1__schema.sql
 ```
 
-`DATABASE_URL` is the JDBC URL. `KAFKA_BROKERS` is the broker list. `KAFKA_SASL_JAAS` is the Kafka login for QAL, E2E, and prod. Those values stay in the environment, not in the profile files. A host that authenticates PostgreSQL separately can add `spring.datasource.username` and `spring.datasource.password` to the profile.
+A container image is `docker build -t activitytrail .` after the JAR exists. Pass the same Spring profile when the container starts.
 
-| Variable | Default | Purpose |
+These customizations stay outside the HTTP and Kafka contracts:
+
+| What to change | How |
+| --- | --- |
+| Database | Replace `PostgresFieldActivityRepository` and the bean in `PostgresRepositoryConfiguration`. The controller and the service keep calling `FieldActivityRepository`. `db/postgres` applies only to PostgreSQL. |
+| Indexes and partitions | Add SQL under [`db/postgres/custom`](db/postgres/custom) with Flyway versions `V1000` and above. Keep `event_id` unique and keep the check constraints. |
+| Retention window | `RETENTION_DAYS_DEFAULT` (default 365), or `retention_days` from 1 to 3650 on registration. JSON `null` keeps that application's rows. |
+| Retention deletion | `RETENTION_ENABLED=false` does not create the cleanup bean, so nothing is deleted. |
+| Access checks inside the process | Extend the controller or the consumer. Keep the record rules, the topic, and the read response. |
+
+## Authentication and access control
+
+This service does not authenticate callers and does not ship API keys, passwords, or tokens.
+
+That is deliberate. The project is cloned and self-hosted. Each organization already has its own identity system, network policy, and Kafka ACLs, and those policies differ. A login built into this process would replace those policies with one that does not fit every host.
+
+The host decides:
+
+| Door | What this service does | What the host controls |
 | --- | --- | --- |
-| `RETENTION_ENABLED` | `true` | `false` disables every retention delete. |
-| `RETENTION_DAYS_DEFAULT` | `365` | Window stored when registration omits `retention_days`. |
+| Registration and read API | Accepts the HTTP calls below. It does not check a credential. | Which programs can reach port 8080, using a private network or a gateway. |
+| Kafka produce | Stores a message when its `application_id` is registered and enabled and the key matches the body. | Which clients may write `activitytrail.field-changes`. |
+| Kafka consume | Joins group `activitytrail` at startup. | Which principal may join that group, and which principal may write the dead-letter topic. |
 
-## Register an application
+A host that needs the check inside this process extends the code. Disabling an application is an update to the `application` row (`enabled = false`). There is no update route. A disabled application returns 403 on read, and new events for it are dead-lettered. Its stored rows remain until retention deletes them.
 
-Call the operator API on the private network. Omit `retention_days` to store the deployment default of 365. Send `null` to keep that application’s history until a person deletes it outside the job.
+## Kafka and API contracts
 
-```sh
-curl -sS -X POST "http://localhost:8080/v1/operator/applications" \
-  -H "Content-Type: application/json" \
-  -d '{"application_id":"customer-profile","display_name":"Customer Profile"}'
-```
+Identifiers use `^[A-Za-z0-9._:-]{1,128}$`. `object_id` is 1–256 characters, not blank, and must not contain `/`. Values are UTF-8 text of at most 8192 characters. Empty string is a real value. Unknown JSON fields are ignored. The client does not send `body_hash` or `recorded_at`.
 
-The 201 response is the registry row. It does not include a secret. Register `orders` the same way. A second registration of the same `application_id` returns 409. Send `"retention_days": 90` to keep 90 days, or `"retention_days": null` to keep that application's rows.
+### Producer
 
-## Publish a field change
+After the publishing application commits its own transaction, it produces one JSON object per changed field to `activitytrail.field-changes`.
 
-After the publishing application commits its own transaction, it produces one JSON object per changed field to `activitytrail.field-changes`. The message key is `{application_id}:{object_name}:{object_id}`. Each application uses its own id in that key and in the body. The consumer stores the row under that `application_id` when the application is registered and enabled. Version 1 does not require a publish header.
+The message key is `{application_id}:{object_name}:{object_id}` and must match the body. There is no required header.
 
 ```json
 {
@@ -132,27 +101,152 @@ After the publishing application commits its own transaction, it produces one JS
   "old_value": "1990-04-12",
   "new_value": "1990-04-21",
   "updated_by": "user:88421",
-  "updated_at": "2026-11-01T09:14:02Z"
+  "updated_at": "2026-11-01T09:14:02Z",
+  "correlation_id": "save-7c2e91"
 }
 ```
 
-The client’s request returns when its own database commits. It does not wait for Activity Trail. A change that is never published is absent from the read API. An empty history means no event was stored.
+| Field | Rule |
+| --- | --- |
+| `event_id` | Client UUID. Same id and same body are stored once. Same id and a different body do not overwrite the row. |
+| `application_id` | Registered application id. |
+| `object_name`, `object_field`, `updated_by` | Identifier pattern. `updated_by` is required. The convention is `user:{id}` or `system:{name}`. |
+| `object_id` | 1–256 characters, no `/`. |
+| `change_type` | `set`, `update`, or `clear`. |
+| `old_value` | Null only for `set`. |
+| `new_value` | Null only for `clear`. An `update` requires both values, and they must differ. |
+| `updated_at` | Client commit time, ISO-8601. More than five minutes ahead of the database clock is rejected. |
+| `correlation_id` | Optional. Groups the fields of one save. |
 
-## Read history
+`set` has a null old value and a non-null new value. `clear` has a non-null old value and a null new value.
 
-The support application calls the path for that application:
+### Consumer
+
+This process is the consumer. It joins group `activitytrail` and reads `activitytrail.field-changes`. It commits the offset after the row is stored, after a duplicate is recognized, or after the dead letter is published. A database error is not committed. The listener retries that record.
+
+| Dead-letter reason | When |
+| --- | --- |
+| `invalid_json` | The value is not JSON. |
+| `validation_failed` | The JSON breaks the record rules, the key does not match the body, or `updated_at` is more than five minutes ahead. |
+| `unknown_application` | `application_id` was never registered. |
+| `application_disabled` | The application is registered and disabled. |
+| `event_conflict` | `event_id` is already stored with a different body. |
+
+The dead-letter topic is `activitytrail.field-changes.dlq`. The header is `X-Activity-Trail-Reason`. The body is:
+
+```json
+{
+  "reason": "validation_failed",
+  "failed_at": "2026-11-01T09:16:00.100000Z",
+  "original": "{...exact message text...}"
+}
+```
+
+`failed_at` is the PostgreSQL clock. The read API does not serve the dead-letter topic.
+
+### Register an application
+
+`POST /v1/operator/applications`
+
+```json
+{
+  "application_id": "customer-profile",
+  "display_name": "Customer Profile",
+  "retention_days": 365
+}
+```
+
+`application_id` is required and must match the identifier pattern. `display_name` is required, 1–200 characters, and not blank. `retention_days` is optional. Omit it to store `RETENTION_DAYS_DEFAULT`, which is 365 unless the host changed it. JSON `null` keeps that application's rows. A number must be an integer from 1 to 3650.
+
+Success is 201:
+
+```json
+{
+  "application_id": "customer-profile",
+  "display_name": "Customer Profile",
+  "retention_days": 365,
+  "enabled": true
+}
+```
+
+The same id again is 409 `application_exists`. An invalid body is 400 `validation_failed`. Until this POST succeeds, Kafka messages for that id are dead-lettered as `unknown_application` and are not stored. `enabled` starts as true. There is no list route and no update route.
+
+```sh
+curl -sS -X POST "http://localhost:8080/v1/operator/applications" \
+  -H "Content-Type: application/json" \
+  -d '{"application_id":"customer-profile","display_name":"Customer Profile"}'
+```
+
+### Read an audit trail
+
+```
+GET /v1/applications/{applicationId}/objects/{objectName}/{objectId}?field=&from=&to=&limit=&cursor=
+```
+
+The path selects one object. Query parameters are optional.
+
+| Query | Rule |
+| --- | --- |
+| `field` | Exact field name. Omit it to return every stored field for that object. |
+| `from` | Inclusive lower bound on `updated_at`. |
+| `to` | Exclusive upper bound on `updated_at`. |
+| `limit` | Page size. Default 50. Range 1–200. |
+| `cursor` | Opaque token from the previous `next_cursor`. |
+
+With no query parameters, the response is the first page of up to 50 rows for that object, newest first, with no time bound. Order is `updated_at`, then `recorded_at`, then `event_id`. The next page sends `next_cursor` back as `cursor`. Pages do not overlap. The API does not use `OFFSET`.
 
 ```sh
 curl -sS \
   "http://localhost:8080/v1/applications/customer-profile/objects/userProfile/u-100?field=dateOfBirth"
 ```
 
-A matching history returns 200 and the old value, the new value, `updated_by`, `updated_at`, and `recorded_at`. No stored rows returns 200 and `"items": []`. The order trail is a different path, `.../applications/orders/objects/order/o-9`. Version 1 does not reject a caller for lacking a read key. Do not expose this API on a public network.
+Success is 200:
 
-`GET /health` returns 200 when the database answers, and 503 when it does not.
+```json
+{
+  "application_id": "customer-profile",
+  "object_name": "userProfile",
+  "object_id": "u-100",
+  "items": [
+    {
+      "event_id": "6f1c2a10-7b44-4e2a-9c31-0a6d5e8b1001",
+      "object_field": "dateOfBirth",
+      "change_type": "update",
+      "old_value": "1990-04-12",
+      "new_value": "1990-04-21",
+      "updated_by": "user:88421",
+      "updated_at": "2026-11-01T09:14:02.000000Z",
+      "recorded_at": "2026-11-01T09:14:03.221412Z",
+      "correlation_id": "save-7c2e91"
+    }
+  ],
+  "next_cursor": null
+}
+```
 
-## Retention
+`items` is empty when nothing is stored, including for an object the service has never seen. That is 200, not 404. `old_value`, `new_value`, and `correlation_id` are JSON strings or `null`. `next_cursor` is a string when another page exists and `null` on the last page. Timestamps are UTC. The response omits `body_hash`.
 
-The same process deletes aged rows at 03:00 UTC. With `RETENTION_ENABLED=true`, the pass deletes rows whose `updated_at` is older than that application’s `retention_days`, 5000 rows at a time. Deletion is permanent. Applications with `retention_days` null are skipped. With `RETENTION_ENABLED=false`, the pass deletes nothing.
+| Status | Code | When |
+| --- | --- | --- |
+| 200 | | History, including an empty `items` list. |
+| 404 | `application_not_found` | The application was never registered. |
+| 403 | `application_disabled` | The application is disabled. |
+| 400 | `invalid_query` | The query is not valid. `from` equal to or later than `to` is this code. |
+| 400 | `invalid_cursor` | The cursor is unreadable, or `field`, `from`, or `to` does not match it. |
 
-Personal data such as email and date of birth stays on the application’s read path until a retention pass deletes the row, or indefinitely when deletion is turned off. Version 1 does not encrypt field values. Database access is as sensitive as the trail.
+A `/v1` error body is:
+
+```json
+{
+  "error": {
+    "code": "application_not_found",
+    "message": "The application is not registered."
+  }
+}
+```
+
+`GET /health` returns 200 `{"status":"ok"}` when the database answers `SELECT 1`, and 503 `{"status":"not_ready"}` otherwise.
+
+## Contributors
+
+If you find a gap in the service, the docs, or the contracts above, open a pull request or an issue on https://github.com/Amitercse/ActivityTrail. The same place is where another team should ask for more information or for help running this service in their own environment. Describe the change you need, or the step that blocked you, and include the profile (`local`, `qal`, `e2e`, or `prod`) you are using. Keep the record rules, the topic, and the read response intact unless the proposal says why they should change.
